@@ -9,6 +9,7 @@ class AgentState(MessagesState):
     # 输入
     user_input: str
     session_id: str
+    intent: str  # "explain" | "quiz" | "summary" | "chat" | "unknown"
 
     # RAG 检索
     retrieved_docs: List[str]

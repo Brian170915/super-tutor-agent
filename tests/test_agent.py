@@ -43,6 +43,24 @@ class TestQueryNode:
         assert len(result["messages"]) == 1
         assert result["messages"][0].content == "勾股定理是什么"
 
+    def test_turn_count_preserved(self):
+        """测试 turn_count 不被重置"""
+        from agent.nodes import query_node
+
+        state = {
+            "user_input": "测试问题",
+            "session_id": "test-session-3",
+            "messages": [],
+            "turn_count": 5,
+        }
+
+        result = query_node(state)
+
+        # turn_count 应该被保留，而不是重置为 0
+        assert result["turn_count"] == 5
+        # intent 应该被初始化为空
+        assert result["intent"] == ""
+
 
 class TestRAGPipeline:
     def test_reciprocal_rank_fusion(self):
@@ -311,9 +329,10 @@ class TestFullGraph:
         graph = build_graph()
         assert graph is not None
 
-        # 检查节点 - 现在有 5 个节点（新增 context_manager）
+        # 检查节点 - 现在有 6 个节点（新增 intent）
         node_names = list(graph.nodes.keys())
         assert "query" in node_names
+        assert "intent" in node_names
         assert "context_manager" in node_names
         assert "rag" in node_names
         assert "chat" in node_names
@@ -355,6 +374,52 @@ class TestFullGraph:
         })
 
         assert "answer" in result
+
+
+class TestRouting:
+    """测试意图路由函数"""
+
+    def test_route_by_intent_explain(self):
+        """explain 意图路由到 rag"""
+        from agent.nodes import route_by_intent
+        assert route_by_intent({"intent": "explain"}) == "rag"
+
+    def test_route_by_intent_unknown(self):
+        """unknown 意图路由到 rag（降级）"""
+        from agent.nodes import route_by_intent
+        assert route_by_intent({"intent": "unknown"}) == "rag"
+
+    def test_route_by_intent_quiz(self):
+        """quiz 意图路由到 chat"""
+        from agent.nodes import route_by_intent
+        assert route_by_intent({"intent": "quiz"}) == "chat"
+
+    def test_route_by_intent_summary(self):
+        """summary 意图路由到 chat"""
+        from agent.nodes import route_by_intent
+        assert route_by_intent({"intent": "summary"}) == "chat"
+
+    def test_route_by_intent_chat(self):
+        """chat 意图路由到 chat"""
+        from agent.nodes import route_by_intent
+        assert route_by_intent({"intent": "chat"}) == "chat"
+
+    def test_route_after_chat_thought(self):
+        """explain 意图 chat 后路由到 thought"""
+        from agent.nodes import route_after_chat
+        assert route_after_chat({"intent": "explain"}) == "thought"
+
+    def test_route_after_chat_end_quiz(self):
+        """quiz 意图 chat 后直接结束"""
+        from agent.nodes import route_after_chat
+        from langgraph.graph import END
+        assert route_after_chat({"intent": "quiz"}) == END
+
+    def test_route_after_chat_end_summary(self):
+        """summary 意图 chat 后直接结束"""
+        from agent.nodes import route_after_chat
+        from langgraph.graph import END
+        assert route_after_chat({"intent": "summary"}) == END
 
 
 class TestContextWindow:

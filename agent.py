@@ -225,14 +225,14 @@ async def root():
         .header { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 16px 24px; display: flex; align-items: center; gap: 12px; }
         .header h1 { font-size: 20px; font-weight: 600; }
         .main { flex: 1; display: flex; overflow: hidden; }
-        .chat-container { flex: 1; display: flex; flex-direction: column; max-width: 800px; margin: 0 auto; width: 100%; }
+        .chat-container { flex: 1; display: flex; flex-direction: column; max-width: 900px; margin: 0 auto; width: 100%; }
         .messages { flex: 1; overflow-y: auto; padding: 20px; }
         .message { margin-bottom: 16px; display: flex; gap: 12px; }
         .message.user { flex-direction: row-reverse; }
         .message .avatar { width: 36px; height: 36px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 18px; flex-shrink: 0; }
         .message.user .avatar { background: #667eea; }
         .message.assistant .avatar { background: #10b981; }
-        .message .bubble { max-width: 70%; padding: 12px 16px; border-radius: 12px; line-height: 1.6; white-space: pre-wrap; word-break: break-word; }
+        .message .bubble { max-width: 95%; padding: 12px 16px; border-radius: 12px; line-height: 1.6; white-space: pre-wrap; word-break: break-word; }
         .message.user .bubble { background: #667eea; color: white; }
         .message.assistant .bubble { background: white; border: 1px solid #e5e7eb; }
         .input-area { padding: 16px 20px; background: white; border-top: 1px solid #e5e7eb; display: flex; gap: 12px; }
@@ -241,20 +241,34 @@ async def root():
         .input-area button { width: 44px; height: 44px; border: none; border-radius: 12px; cursor: pointer; font-size: 20px; transition: background 0.2s; }
         .btn-send { background: #667eea; color: white; }
         .btn-send:hover { background: #5a6fd6; }
-        .mindmap-panel { width: 400px; background: white; border-left: 1px solid #e5e7eb; display: none; flex-direction: column; overflow: hidden; }
-        .mindmap-panel.active { display: flex; }
-        .mindmap-panel .panel-header { padding: 16px; border-bottom: 1px solid #e5e7eb; font-weight: 600; }
-        .mindmap-panel .panel-body { flex: 1; overflow: auto; padding: 16px; }
-        .mindmap-panel .panel-body .mermaid { display: flex; justify-content: center; }
-        .mindmap-section { margin-top: 12px; padding: 12px; background: #f8f9fa; border-radius: 8px; border: 1px solid #e5e7eb; }
-        .mindmap-label { font-size: 13px; font-weight: 600; color: #495057; margin-bottom: 8px; }
-        .mindmap-mermaid { display: flex; justify-content: center; margin-bottom: 8px; overflow-x: auto; }
+        .mindmap-section { margin-top: 12px; padding: 12px; background: #f0f4ff; border-radius: 10px; border: 1px solid #c7d2fe; cursor: zoom-in; position: relative; transition: background 0.2s; }
+        .mindmap-section:hover { background: #e0eaff; }
+        .mindmap-label { font-size: 13px; font-weight: 600; color: #4338ca; margin-bottom: 8px; display: flex; align-items: center; gap: 6px; }
+        .mindmap-label .zoom-hint { font-size: 11px; color: #818cf8; font-weight: 400; margin-left: auto; }
+        .mindmap-mermaid { overflow-x: auto; }
         .mindmap-mermaid .mermaid { display: flex; justify-content: center; }
-        .mindmap-download { width: 100%; padding: 8px; border: 1px solid #dee2e6; border-radius: 6px; background: white; cursor: pointer; font-size: 13px; color: #495057; transition: background 0.2s; }
-        .mindmap-download:hover { background: #e9ecef; }
+        .mindmap-download { margin-top: 8px; padding: 6px 12px; border: 1px solid #c7d2fe; border-radius: 6px; background: white; cursor: pointer; font-size: 12px; color: #4338ca; transition: background 0.2s; }
+        .mindmap-download:hover { background: #e0eaff; }
         .loading { color: #9ca3af; font-style: italic; }
         .context-badge { display: inline-block; background: #fef3c7; color: #92400e; padding: 2px 8px; border-radius: 4px; font-size: 12px; margin-top: 8px; }
-        @media (max-width: 900px) { .mindmap-panel { display: none !important; } }
+        /* 缩放模态框 */
+        .zoom-overlay { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.7); z-index: 1000; justify-content: center; align-items: center; }
+        .zoom-overlay.active { display: flex; }
+        .zoom-container { position: relative; width: 90vw; height: 90vh; background: white; border-radius: 16px; overflow: hidden; display: flex; flex-direction: column; }
+        .zoom-toolbar { display: flex; align-items: center; gap: 8px; padding: 12px 16px; border-bottom: 1px solid #e5e7eb; background: #f9fafb; flex-shrink: 0; }
+        .zoom-toolbar .title { font-size: 14px; font-weight: 600; color: #374151; flex: 1; }
+        .zoom-toolbar button { padding: 6px 12px; border: 1px solid #d1d5db; border-radius: 6px; background: white; cursor: pointer; font-size: 13px; transition: background 0.2s; }
+        .zoom-toolbar button:hover { background: #f3f4f6; }
+        .zoom-toolbar .btn-close { color: #ef4444; border-color: #fca5a5; }
+        .zoom-toolbar .btn-close:hover { background: #fef2f2; }
+        .zoom-body { flex: 1; overflow: hidden; position: relative; }
+        .zoom-body .mermaid-wrap { width: 100%; height: 100%; display: flex; justify-content: center; align-items: flex-start; overflow: auto; cursor: grab; }
+        .zoom-body .mermaid-wrap:active { cursor: grabbing; }
+        .zoom-body .mermaid-wrap svg { max-width: none; transition: transform 0.15s ease; transform-origin: top center; }
+        @media (max-width: 768px) {
+            .chat-container { padding: 0; }
+            .message .bubble { max-width: 100%; }
+        }
     </style>
 </head>
 <body>
@@ -275,9 +289,22 @@ async def root():
                 <button class="btn-send" id="sendBtn">➤</button>
             </div>
         </div>
-        <div class="mindmap-panel" id="mindmapPanel">
-            <div class="panel-header">📊 知识点思维导图</div>
-            <div class="panel-body" id="mindmapBody"></div>
+    </div>
+    <!-- 缩放模态框 -->
+    <div class="zoom-overlay" id="zoomOverlay">
+        <div class="zoom-container">
+            <div class="zoom-toolbar">
+                <span class="title">📊 知识点思维导图</span>
+                <button onclick="zoomOut()">➖ 缩小</button>
+                <button onclick="zoomReset()">↺ 重置</button>
+                <button onclick="zoomIn()">➕ 放大</button>
+                <button class="btn-close" onclick="closeZoom()">✕ 关闭</button>
+            </div>
+            <div class="zoom-body">
+                <div class="mermaid-wrap" id="zoomWrap">
+                    <div class="mermaid" id="zoomContent"></div>
+                </div>
+            </div>
         </div>
     </div>
     <script>
@@ -288,8 +315,13 @@ async def root():
         const messagesEl = document.getElementById('messages');
         const userInput = document.getElementById('userInput');
         const sendBtn = document.getElementById('sendBtn');
-        const mindmapPanel = document.getElementById('mindmapPanel');
-        const mindmapBody = document.getElementById('mindmapBody');
+        const zoomOverlay = document.getElementById('zoomOverlay');
+        const zoomWrap = document.getElementById('zoomWrap');
+        const zoomContent = document.getElementById('zoomContent');
+
+        // 缩放状态
+        let zoomLevel = 1;
+        let currentMermaidCode = '';
 
         userInput.addEventListener('input', () => {
             userInput.style.height = 'auto';
@@ -300,11 +332,9 @@ async def root():
             const msgEl = document.createElement('div');
             msgEl.className = `message ${role}`;
             let bubbleContent = content;
-            // 思维导图渲染在气泡内，不显示源码
             if (metadata.mindmap && metadata.mindmap.trim()) {
                 setTimeout(() => renderMindmapInline(msgEl, metadata.mindmap), 100);
             }
-            // 显示上下文信息
             let contextBadge = '';
             if (metadata.context && metadata.context.turn_count > 0) {
                 contextBadge = `<div class="context-badge">第${metadata.context.turn_count}轮对话</div>`;
@@ -322,29 +352,145 @@ async def root():
             const bubble = msgEl.querySelector('.bubble');
             const section = document.createElement('div');
             section.className = 'mindmap-section';
-            section.innerHTML = '<div class="mindmap-label">📊 知识点思维导图</div>';
-
+            section.innerHTML = `
+                <div class="mindmap-label">
+                    📊 知识点思维导图
+                    <span class="zoom-hint">点击放大</span>
+                </div>
+            `;
             const mermaidDiv = document.createElement('div');
             mermaidDiv.className = 'mindmap-mermaid';
             mermaidDiv.innerHTML = `<div class="mermaid">${mermaidCode}</div>`;
             section.appendChild(mermaidDiv);
 
-            // 下载按钮
             const downloadBtn = document.createElement('button');
             downloadBtn.className = 'mindmap-download';
-            downloadBtn.textContent = '📥 下载思维导图';
-            downloadBtn.addEventListener('click', () => downloadMindmap(mermaidCode));
+            downloadBtn.textContent = '📥 下载 SVG';
+            downloadBtn.addEventListener('click', (e) => {
+                e.stopPropagation();
+                downloadMindmap(mermaidCode);
+            });
             section.appendChild(downloadBtn);
 
             bubble.appendChild(section);
 
-            // 渲染 mermaid
+            // 点击整块区域打开缩放
+            section.addEventListener('click', (e) => {
+                if (e.target === downloadBtn || e.target.closest('.mindmap-download')) return;
+                openZoom(mermaidCode);
+            });
+
             try {
                 mermaid.run({ nodes: mermaidDiv.querySelectorAll('.mermaid') });
             } catch (e) {
                 mermaidDiv.innerHTML = `<pre>${mermaidCode}</pre>`;
             }
         }
+
+        // ============ 缩放功能 ============
+        function openZoom(mermaidCode) {
+            currentMermaidCode = mermaidCode;
+            zoomLevel = 1;
+            zoomContent.innerHTML = `<div class="mermaid">${mermaidCode}</div>`;
+            zoomOverlay.classList.add('active');
+            zoomWrap.style.transform = '';
+            zoomWrap.style.transformOrigin = 'top left';
+
+            // 渲染 mermaid
+            try {
+                mermaid.run({ nodes: zoomContent.querySelectorAll('.mermaid') });
+            } catch (e) {}
+
+            // 等 SVG 生成后再缩放
+            setTimeout(() => applyZoom(), 100);
+        }
+
+        function closeZoom() {
+            zoomOverlay.classList.remove('active');
+        }
+
+        function applyZoom() {
+            const svg = zoomContent.querySelector('svg');
+            if (!svg) return;
+            // 获取 SVG 原始尺寸，放大显示
+            const wrapW = zoomWrap.clientWidth;
+            const wrapH = zoomWrap.clientHeight;
+            const svgW = svg.getAttribute('width');
+            const svgH = svg.getAttribute('height');
+            if (svgW && svgH) {
+                const scale = Math.min(
+                    Math.min(wrapW / parseFloat(svgW), 1) * 1.5,
+                    Math.min(wrapH / parseFloat(svgH), 1) * 1.5
+                );
+                const finalScale = Math.max(0.8, Math.min(scale, 2.5));
+                zoomLevel = finalScale;
+                svg.style.transform = `scale(${zoomLevel})`;
+                svg.style.transformOrigin = 'top center';
+                svg.style.display = 'block';
+            }
+        }
+
+        function zoomIn() {
+            zoomLevel = Math.min(zoomLevel * 1.3, 4);
+            const svg = zoomContent.querySelector('svg');
+            if (svg) {
+                svg.style.transform = `scale(${zoomLevel})`;
+            }
+        }
+
+        function zoomOut() {
+            zoomLevel = Math.max(zoomLevel / 1.3, 0.3);
+            const svg = zoomContent.querySelector('svg');
+            if (svg) {
+                svg.style.transform = `scale(${zoomLevel})`;
+            }
+        }
+
+        function zoomReset() {
+            zoomLevel = 1;
+            const svg = zoomContent.querySelector('svg');
+            if (svg) svg.style.transform = 'scale(1)';
+        }
+
+        // 鼠标滚轮缩放
+        zoomWrap.addEventListener('wheel', (e) => {
+            e.preventDefault();
+            if (e.deltaY < 0) zoomIn();
+            else zoomOut();
+        }, { passive: false });
+
+        // 点击遮罩关闭
+        zoomOverlay.addEventListener('click', (e) => {
+            if (e.target === zoomOverlay) closeZoom();
+        });
+
+        // ESC 关闭
+        document.addEventListener('keydown', (e) => {
+            if (e.key === 'Escape') closeZoom();
+        });
+
+        // 拖拽平移
+        let isDragging = false, dragStartX, dragStartY, scrollStartX, scrollStartY;
+        zoomWrap.addEventListener('mousedown', (e) => {
+            if (e.target.closest('.mermaid')) {
+                isDragging = true;
+                dragStartX = e.clientX;
+                dragStartY = e.clientY;
+                scrollStartX = zoomWrap.scrollLeft;
+                scrollStartY = zoomWrap.scrollTop;
+                zoomWrap.style.cursor = 'grabbing';
+            }
+        });
+        document.addEventListener('mousemove', (e) => {
+            if (!isDragging) return;
+            e.preventDefault();
+            zoomWrap.scrollLeft = scrollStartX - (e.clientX - dragStartX);
+            zoomWrap.scrollTop = scrollStartY - (e.clientY - dragStartY);
+        });
+        document.addEventListener('mouseup', () => {
+            isDragging = false;
+            zoomWrap.style.cursor = 'grab';
+        });
 
         function downloadMindmap(mermaidCode) {
             const mermaidDiv = document.createElement('div');
@@ -365,7 +511,6 @@ async def root():
                     URL.revokeObjectURL(url);
                 }
             }).catch(() => {
-                // 降级：下载 SVG 源码
                 const blob = new Blob([mermaidCode], { type: 'text/plain;charset=utf-8' });
                 const url = URL.createObjectURL(blob);
                 const a = document.createElement('a');

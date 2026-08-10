@@ -4,11 +4,15 @@ Agent 节点实现 - 带上下文管理
 import os
 from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
+from langgraph.graph import START, END
 from agent.state import AgentState
 from agent.prompts import (
     REPHRASE_PROMPT,
     CHAT_PROMPT,
     MINDMAP_PROMPT,
+    INTENT_PROMPT,
+    QUIZ_PROMPT,
+    SUMMARY_RESPONSE_PROMPT,
 )
 from agent.context_manager import ContextManager, estimate_tokens
 from agent.context_tracker import get_tracker
@@ -82,10 +86,54 @@ def query_node(state: AgentState) -> AgentState:
         "subject_history": [],
         "knowledge_gaps": [],
         "conversation_summary": "",
-        "turn_count": 0,
+        # turn_count 不再重置，由 context_tracker 递增
+        "intent": "",
         "answer": "",
         "mindmap_mermaid": "",
     }
+
+
+def intent_node(state: AgentState) -> AgentState:
+    """识别用户意图，返回 intent 字段"""
+    llm = get_llm()
+    user_input = state.get("user_input", "")
+    messages = state.get("messages", [])
+
+    # 构建最近对话上下文（取最近 3 条人机对话）
+    recent = [m for m in messages[-3:] if m.type in ("human", "ai")]
+    recent_context = "\n".join(
+        f"{'学生' if m.type == 'human' else '老师'}: {m.content[:100]}"
+        for m in recent
+    ) if recent else "无"
+
+    try:
+        chain = INTENT_PROMPT | llm
+        result = chain.invoke({"user_input": user_input, "recent_context": recent_context})
+        intent = result.content.strip().lower()
+    except Exception:
+        intent = "unknown"
+
+    valid_intents = {"explain", "quiz", "summary", "chat", "unknown"}
+    if intent not in valid_intents:
+        intent = "unknown"
+
+    return {**state, "intent": intent}
+
+
+def route_by_intent(state: AgentState):
+    """根据意图路由到 rag 或 chat"""
+    intent = state.get("intent", "unknown")
+    if intent in ("explain", "unknown"):
+        return "rag"
+    return "chat"
+
+
+def route_after_chat(state: AgentState):
+    """根据意图决定是否生成思维导图"""
+    intent = state.get("intent", "unknown")
+    if intent in ("quiz", "summary"):
+        return END
+    return "thought"
 
 
 def context_manager_node(state: AgentState) -> AgentState:
@@ -216,34 +264,55 @@ def _compress_docs(docs: list, max_chars_per_doc: int = 400) -> list:
 def chat_node(state: AgentState) -> AgentState:
     """生成答疑回答（使用完整对话历史 + 上下文管理）"""
     llm = get_llm()
+    intent = state.get("intent", "unknown")
 
+    # 直接使用 context_manager_node 管理后的消息（避免双重管理）
     messages = list(state.get("messages", []))
     retrieved_docs = state.get("retrieved_docs", [])
     current_topics = state.get("current_topics", [])
     knowledge_gaps = state.get("knowledge_gaps", [])
     conversation_summary = state.get("conversation_summary", "")
 
-    # 构建上下文
-    context = "\n\n".join(retrieved_docs) if retrieved_docs else "无额外上下文，请依靠模型自身知识解答。"
-
-    # 使用 ContextManager 构建带预算的消息列表
-    context_result = _context_manager.assemble_context(
-        messages,
-        rag_context=context,
-        llm=llm,
-    )
-    final_messages = context_result["messages"]
-    token_count = context_result["token_count"]
-    is_truncated = context_result["truncated"]
-
     # 构建系统提示
     topics_str = ", ".join(current_topics) if current_topics else "无"
     gaps_str = ", ".join(knowledge_gaps) if knowledge_gaps else "无"
     summary_str = conversation_summary if conversation_summary else "新对话"
 
-    system_msg = {
-        "role": "system",
-        "content": f"""你是一个友好的初中教育智能体，名叫"小智老师"。
+    # 根据意图选择不同处理路径
+    if intent == "quiz":
+        # 出题模式：从历史中提取对话文本
+        history_text = "\n".join(
+            f"{'学生' if m.type == 'human' else '老师'}: {m.content}"
+            for m in messages[-10:] if m.type in ("human", "ai")
+        )
+        chain = QUIZ_PROMPT | llm
+        response = chain.invoke({
+            "user_input": state.get("user_input", ""),
+            "topics": topics_str,
+            "gaps": gaps_str,
+            "history": history_text,
+        })
+    elif intent == "summary":
+        # 总结模式
+        history_text = "\n".join(
+            f"{'学生' if m.type == 'human' else '老师'}: {m.content}"
+            for m in messages[-10:] if m.type in ("human", "ai")
+        )
+        chain = SUMMARY_RESPONSE_PROMPT | llm
+        response = chain.invoke({
+            "user_input": state.get("user_input", ""),
+            "topics": topics_str,
+            "gaps": gaps_str,
+            "history": history_text,
+        })
+    else:
+        # 默认讲解模式（explain / chat / unknown）
+        # 构建 RAG 上下文
+        rag_context = "\n\n".join(retrieved_docs) if retrieved_docs else "无额外上下文，请依靠模型自身知识解答。"
+
+        system_msg = {
+            "role": "system",
+            "content": f"""你是一个友好的初中教育智能体，名叫"小智老师"。
 
 你的职责：
 1. 根据提供的参考资料解答学生的问题
@@ -262,44 +331,47 @@ def chat_node(state: AgentState) -> AgentState:
 - 正在讨论的知识点：{topics_str}
 - 学生可能有困难的地方：{gaps_str}
 - 对话摘要：{summary_str}"""
-    }
+        }
 
-    rag_context_msg = {
-        "role": "system",
-        "content": f"""【参考资料】
-{context}
+        rag_context_msg = {
+            "role": "system",
+            "content": f"""【参考资料】
+{rag_context}
 
 如果参考资料与问题无关，请忽略参考资料，直接回答问题。"""
-    }
+        }
 
-    # 构建完整消息链
-    full_messages = [system_msg, rag_context_msg] + [
-        {"role": msg.type, "content": msg.content}
-        for msg in final_messages if msg.type in ("human", "ai")
-    ]
+        # 构建完整消息链
+        full_messages = [system_msg, rag_context_msg] + [
+            {"role": msg.type, "content": msg.content}
+            for msg in messages if msg.type in ("human", "ai")
+        ]
 
-    response = llm.invoke(full_messages)
+        response = llm.invoke(full_messages)
 
-    # 更新跨轮次追踪
+    # 更新跨轮次追踪（所有意图都更新）
     tracker = get_tracker()
+    turn_count = state.get("turn_count", 0)
     if state.get("session_id"):
         tracker_result = tracker.update_from_query(
             state["session_id"],
-            final_messages,
+            messages,
             llm
         )
         current_topics = tracker_result.get("current_topics", current_topics)
         knowledge_gaps = tracker_result.get("knowledge_gaps", knowledge_gaps)
         conversation_summary = tracker_result.get("conversation_summary", conversation_summary)
+        turn_count = tracker_result.get("turn_count", turn_count)
 
     return {
         **state,
         "answer": response.content,
-        "context_token_count": token_count,
-        "context_truncated": is_truncated,
+        "context_token_count": state.get("context_token_count", 0),
+        "context_truncated": state.get("context_truncated", False),
         "current_topics": current_topics,
         "knowledge_gaps": knowledge_gaps,
         "conversation_summary": conversation_summary,
+        "turn_count": turn_count,
     }
 
 
