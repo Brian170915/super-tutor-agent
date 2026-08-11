@@ -160,9 +160,9 @@ class CrossTurnTracker:
         # 去重
         return list(set(gaps))[:5]  # 最多保留5个困难点
 
-    def update_summary(self, messages: List[BaseMessage], llm=None):
+    def update_summary(self, session_id: str, messages: List[BaseMessage], llm=None):
         """增量更新对话摘要"""
-        tracker = self._trackers.get("main")
+        tracker = self.get_or_create(session_id)
         if not tracker:
             return
 
@@ -224,7 +224,7 @@ class CrossTurnTracker:
         tracker.knowledge_gaps = tracker.knowledge_gaps[-3:]  # 最多3个
 
         # 更新摘要
-        self.update_summary(messages, llm)
+        self.update_summary(session_id, messages, llm)
 
         # 同步到 AgentState
         return {

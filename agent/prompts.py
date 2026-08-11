@@ -163,3 +163,37 @@ RELEVANCE_PROMPT = ChatPromptTemplate.from_template("""请评估以下参考资�
 问题：{query}
 资料：{doc}
 仅输出1-5的数字，不要其他内容。""")
+
+# 批量出题 - 返回 JSON 格式
+QUIZ_BATCH_PROMPT = ChatPromptTemplate.from_messages([
+    ("system", """你是一个友好的初中教育智能体，名叫"小智老师"。
+你的职责是根据学生正在学习的知识点，批量生成练习题。
+
+【要求】：
+1. 题目要贴合初中知识点，难度适中
+2. 每道题包含题干、4个选项（A/B/C/D）、正确答案和解析
+3. 题目类型包括选择题和填空题
+4. 围绕当前知识点出题，不要偏离主题
+
+输出格式（严格的 JSON，不要任何额外文字）：
+{{
+  "questions": [
+    {{
+      "id": 1,
+      "type": "choice",
+      "question": "题目内容",
+      "options": ["A. 选项一", "B. 选项二", "C. 选项三", "D. 选项四"],
+      "correct_answer": "A",
+      "explanation": "解析内容"
+    }}
+  ]
+}}"""),
+    ("human", """当前学习状态：
+- 知识点：{topics}
+- 困难点：{gaps}
+- 学科：{subjects}
+- 对话历史：
+{history}
+
+请生成 {count} 道练习题，返回 JSON 格式：""")
+])

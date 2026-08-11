@@ -309,16 +309,14 @@ class TestRAGScoring:
 
 
 class TestOCRClient:
-    @pytest.mark.skip(reason="需要 Agnes API 可用")
-    def test_recognize_image(self):
-        """测试 OCR 识别（需要真实 API）"""
-        from ocr.agnes_client import AgnesOCRClient
+    @pytest.mark.skip(reason="需要 PaddleOCR API 可用")
+    def test_ocr_client_exists(self):
+        """测试 PaddleOCR 客户端可导入"""
+        from ocr.agnes_client import PaddleOCRClient
 
-        client = AgnesOCRClient()
-        # 这里需要实际的测试图片，暂时跳过
-        # result = client.recognize("test_image.jpg")
-        # assert isinstance(result, str)
-        # assert len(result) > 0
+        client = PaddleOCRClient()
+        assert client.headers["Authorization"].startswith("bearer ")
+        assert client.model == "PaddleOCR-VL-1.6"
 
 
 class TestFullGraph:
@@ -443,6 +441,57 @@ class TestContextWindow:
         result = cm.assemble_context(long_messages, rag_context="短上下文")
         assert result["truncated"] == True
         assert len(result["messages"]) < len(long_messages)
+
+
+class TestQuizPrompt:
+    """测试批量出题 Prompt"""
+
+    def test_quiz_batch_prompt_exists(self):
+        """测试 QUIZ_BATCH_PROMPT 已定义"""
+        from agent.prompts import QUIZ_BATCH_PROMPT
+        assert QUIZ_BATCH_PROMPT is not None
+        assert hasattr(QUIZ_BATCH_PROMPT, 'input_variables')
+
+    def test_quiz_batch_prompt_variables(self):
+        """测试 Prompt 变量"""
+        from agent.prompts import QUIZ_BATCH_PROMPT
+        expected_vars = {"topics", "gaps", "subjects", "history", "count"}
+        actual_vars = set(QUIZ_BATCH_PROMPT.input_variables)
+        assert expected_vars.issubset(actual_vars)
+
+
+class TestFeatureEndpoints:
+    """测试功能面板相关端点结构"""
+
+    def _load_root_agent(self):
+        """加载根目录的 agent.py 模块（避免与 agent/ 包冲突）"""
+        import importlib.util
+        import os
+        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        agent_path = os.path.join(project_root, "agent.py")
+        spec = importlib.util.spec_from_file_location("root_agent", agent_path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def test_quiz_request_model(self):
+        """测试出题请求模型"""
+        mod = self._load_root_agent()
+        req = mod.QuizRequest(session_id="test-123", count=5)
+        assert req.session_id == "test-123"
+        assert req.count == 5
+
+    def test_chat_request_with_image(self):
+        """测试带图片的聊天请求"""
+        mod = self._load_root_agent()
+        req = mod.ChatRequest(session_id="test", user_input="你好", image_base64="dGVzdA==")
+        assert req.image_base64 == "dGVzdA=="
+
+    def test_chat_request_without_image(self):
+        """测试不带图片的聊天请求"""
+        mod = self._load_root_agent()
+        req = mod.ChatRequest(session_id="test", user_input="你好")
+        assert req.image_base64 == ""
 
 
 if __name__ == "__main__":
