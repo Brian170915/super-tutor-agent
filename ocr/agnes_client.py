@@ -10,9 +10,9 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-JOB_URL = "https://paddleocr.aistudio-app.com/api/v2/ocr/jobs"
-TOKEN = os.getenv("PADDLEOCR_TOKEN", "ace5c7f3f0c2769c0f85366a7230c58f2b1b5600")
-MODEL = "PaddleOCR-VL-1.6"
+JOB_URL = os.getenv("PADDLEOCR_URL", "https://paddleocr.aistudio-app.com/api/v2/ocr/jobs")
+TOKEN = os.getenv("PADDLEOCR_TOKEN", "")
+MODEL = os.getenv("PADDLEOCR_MODEL", "PaddleOCR-VL-1.6")
 
 OPTIONAL_PAYLOAD = {
     "useDocOrientationClassify": False,
@@ -70,7 +70,8 @@ class PaddleOCRClient:
         # 提交 job
         data = {
             "model": MODEL,
-            "optionalPayload": json.dumps(OPTIONAL_PAYLOAD),
+            "opt"
+            "ionalPayload": json.dumps(OPTIONAL_PAYLOAD),
         }
         with open(file_path, "rb") as f:
             files = {"file": f}

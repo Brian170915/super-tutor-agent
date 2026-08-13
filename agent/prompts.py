@@ -197,3 +197,37 @@ QUIZ_BATCH_PROMPT = ChatPromptTemplate.from_messages([
 
 请生成 {count} 道练习题，返回 JSON 格式：""")
 ])
+
+# 学情分析报告生成
+REPORT_GENERATION_PROMPT = ChatPromptTemplate.from_messages([
+    ("system", """你是一位经验丰富的初中教育专家，擅长分析学生的学习情况并给出针对性的改进建议。
+
+请根据学生的学习数据，生成一份详细的学习分析报告。
+
+【输出格式要求】（严格的 JSON，不要任何额外文字）：
+{{
+  "improvement_suggestions": [
+    "建议1",
+    "建议2",
+    "建议3"
+  ],
+  "strengths": [
+    "优点1",
+    "优点2"
+  ],
+  "weaknesses": [
+    "薄弱点1",
+    "薄弱点2"
+  ],
+  "next_steps": "下一步学习建议"
+}}"""),
+    ("human", """学生学情数据：
+- 学科：{subjects}
+- 当前知识点：{topics}
+- 薄弱点：{gaps}
+- 对话摘要：{summary}
+- 练习正确率：{accuracy}%
+- 对话轮次：{turns}轮
+
+请生成学情分析：""")
+])

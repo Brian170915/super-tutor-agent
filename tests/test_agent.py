@@ -316,7 +316,7 @@ class TestOCRClient:
 
         client = PaddleOCRClient()
         assert client.headers["Authorization"].startswith("bearer ")
-        assert client.model == "PaddleOCR-VL-1.6"
+        assert client.model == os.getenv("PADDLEOCR_MODEL", "PaddleOCR-VL-1.6")
 
 
 class TestFullGraph:

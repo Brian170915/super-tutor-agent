@@ -2,6 +2,7 @@
 跨轮次上下文追踪器 — 学科/知识点/困难点追踪
 """
 import threading
+from datetime import datetime
 from typing import List, Optional, Dict
 from langchain_core.messages import BaseMessage
 
@@ -20,6 +21,9 @@ class SessionTracker:
         self.turn_count: int = 0                    # 对话轮次
         self.last_query: str = ""                   # 上一次问题
         self.last_subject: Optional[str] = None     # 最后讨论的学科
+        self.quiz_records: List[dict] = []          # 练习记录列表
+        self.last_quiz_score: Optional[float] = None  # 最近一次练习正确率
+        self.session_start_time: str = datetime.now().isoformat()  # 会话创建时间
 
     def to_dict(self) -> dict:
         return {
@@ -30,6 +34,9 @@ class SessionTracker:
             "conversation_summary": self.conversation_summary,
             "turn_count": self.turn_count,
             "last_subject": self.last_subject,
+            "quiz_records": self.quiz_records,
+            "last_quiz_score": self.last_quiz_score,
+            "session_start_time": self.session_start_time,
         }
 
 
@@ -233,6 +240,28 @@ class CrossTurnTracker:
             "knowledge_gaps": tracker.knowledge_gaps,
             "conversation_summary": tracker.conversation_summary,
             "turn_count": tracker.turn_count,
+        }
+
+    def add_quiz_record(self, session_id: str, record: dict):
+        """添加练习记录"""
+        tracker = self.get_or_create(session_id)
+        tracker.quiz_records.append(record)
+        tracker.last_quiz_score = record.get("accuracy", 0)
+
+    def get_quiz_summary(self, session_id: str) -> dict:
+        """获取练习统计摘要"""
+        tracker = self.get_or_create(session_id)
+        records = tracker.quiz_records
+        if not records:
+            return {"total_quizzes": 0, "total_questions": 0, "total_correct": 0, "avg_accuracy": 0}
+        total_q = sum(r.get("total_count", 0) for r in records)
+        total_c = sum(r.get("correct_count", 0) for r in records)
+        return {
+            "total_quizzes": len(records),
+            "total_questions": total_q,
+            "total_correct": total_c,
+            "avg_accuracy": total_c / total_q if total_q > 0 else 0,
+            "records": records,
         }
 
 

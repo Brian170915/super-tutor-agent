@@ -16,7 +16,8 @@ from langserve import add_routes
 from agent.graph import build_graph
 from rag.knowledge_structure import KNOWLEDGE_STRUCTURE, get_subjects, get_grades, get_topics
 from agent.context_tracker import get_tracker
-from agent.prompts import QUIZ_BATCH_PROMPT
+from agent.session_records import get_record_store
+from agent.prompts import QUIZ_BATCH_PROMPT, REPORT_GENERATION_PROMPT
 
 load_dotenv()
 
@@ -381,6 +382,509 @@ async def study_report_endpoint(session_id: str):
         "subject_history": st.subject_history,
         "conversation_summary": st.conversation_summary,
     }
+
+
+# ============ 学情分析报告相关端点 ============
+
+@app.get("/api/report-data/{session_id}")
+async def report_data_endpoint(session_id: str):
+    """获取完整的学情分析报告数据"""
+    tracker = get_tracker()
+    st = tracker.get_or_create(session_id)
+    record_store = get_record_store()
+
+    # 从 LangGraph 获取最新状态
+    config = {"configurable": {"thread_id": session_id}}
+    try:
+        state = graph.get_state(config)
+        st.current_topics = state.values.get("current_topics", st.current_topics)
+        st.knowledge_gaps = state.values.get("knowledge_gaps", st.knowledge_gaps)
+        st.subject_history = state.values.get("subject_history", st.subject_history)
+        st.turn_count = state.values.get("turn_count", st.turn_count)
+        st.conversation_summary = state.values.get("context_summary", st.conversation_summary)
+    except Exception:
+        pass
+
+    has_data = st.turn_count > 0 or st.current_topics or st.subject_history
+    if not has_data:
+        return {
+            "empty": True,
+            "message": "暂无学习数据，多提问来生成报告吧",
+            "turn_count": 0,
+            "current_topics": [],
+            "knowledge_gaps": [],
+            "subject_history": [],
+            "conversation_summary": "",
+            "mastery_levels": {},
+            "quiz_summary": {"total_quizzes": 0, "total_questions": 0, "total_correct": 0, "avg_accuracy": 0},
+            "improvement_suggestions": [],
+            "strengths": [],
+            "weaknesses": [],
+            "next_steps": "",
+        }
+
+    # 获取练习记录
+    quiz_summary = record_store.get_session_summary(session_id)
+
+    # 计算知识点掌握度
+    mastery_levels = _calculate_mastery(st, quiz_summary)
+
+    # 获取对话历史（用于生成建议）
+    try:
+        state = graph.get_state(config)
+        messages = state.values.get("messages", [])
+        history_texts = [
+            f"{'学生' if m.type == 'human' else '老师'}: {m.content[:150]}"
+            for m in messages[-10:] if m.type in ("human", "ai")
+        ]
+        history_text = "\n".join(history_texts)
+    except Exception:
+        history_text = ""
+
+    # 调用 LLM 生成改进建议
+    improvement_suggestions = []
+    strengths = []
+    weaknesses = []
+    next_steps = ""
+    try:
+        from agent.nodes import get_llm
+        llm = get_llm()
+        accuracy_pct = int(quiz_summary.get("avg_accuracy", 0) * 100)
+        chain = REPORT_GENERATION_PROMPT | llm
+        result = chain.invoke({
+            "subjects": ", ".join(st.subject_history) if st.subject_history else "初中各科",
+            "topics": ", ".join(st.current_topics) if st.current_topics else "无",
+            "gaps": ", ".join(st.knowledge_gaps) if st.knowledge_gaps else "无",
+            "summary": st.conversation_summary or "无摘要",
+            "accuracy": accuracy_pct,
+            "turns": st.turn_count,
+        })
+        content = result.content.strip()
+        if content.startswith("```"):
+            content = content.split("\n", 1)[1]
+        if content.endswith("```"):
+            content = content[:-3].rstrip()
+        report_data = json.loads(content)
+        improvement_suggestions = report_data.get("improvement_suggestions", [])
+        strengths = report_data.get("strengths", [])
+        weaknesses = report_data.get("weaknesses", [])
+        next_steps = report_data.get("next_steps", "")
+    except Exception as e:
+        print(f"生成改进建议失败: {e}")
+
+    return {
+        "empty": False,
+        "turn_count": st.turn_count,
+        "current_topics": st.current_topics,
+        "knowledge_gaps": st.knowledge_gaps,
+        "subject_history": st.subject_history,
+        "conversation_summary": st.conversation_summary,
+        "mastery_levels": mastery_levels,
+        "quiz_summary": quiz_summary,
+        "improvement_suggestions": improvement_suggestions,
+        "strengths": strengths,
+        "weaknesses": weaknesses,
+        "next_steps": next_steps,
+        "session_start_time": st.session_start_time,
+    }
+
+
+def _calculate_mastery(st, quiz_summary: dict) -> dict:
+    """计算各知识点的掌握度分数"""
+    mastery = {}
+    base_score = 50
+
+    # 基于对话轮次给基础分
+    for topic in st.current_topics:
+        mastery[topic] = base_score + min(st.turn_count * 3, 20)
+
+    # 基于薄弱点扣分
+    for gap in st.knowledge_gaps:
+        for topic in st.current_topics:
+            if topic in gap:
+                mastery[topic] = max(0, mastery.get(topic, base_score) - 15)
+
+    # 基于练习正确率调整
+    avg_accuracy = quiz_summary.get("avg_accuracy", 0)
+    for topic in mastery:
+        mastery[topic] = min(100, max(0, mastery[topic] + int(avg_accuracy * 30 - 15)))
+
+    return mastery
+
+
+@app.get("/api/sessions")
+async def list_sessions_endpoint():
+    """获取所有会话列表"""
+    tracker = get_tracker()
+    sessions = []
+    for sid, st in tracker._trackers.items():
+        sessions.append({
+            "session_id": sid,
+            "subject_history": st.subject_history,
+            "current_topics": st.current_topics,
+            "turn_count": st.turn_count,
+            "conversation_summary": st.conversation_summary[:100] if st.conversation_summary else "",
+            "session_start_time": st.session_start_time,
+        })
+    # 按创建时间排序
+    sessions.sort(key=lambda x: x.get("session_start_time", ""), reverse=True)
+    return {"sessions": sessions}
+
+
+@app.get("/report/{session_id}", response_class=HTMLResponse)
+async def report_page(session_id: str):
+    """返回学情分析报告页面"""
+    return """<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>学情分析报告 - 小智老师</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #f0f2f5; min-height: 100vh; }
+        .header { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 16px 24px; display: flex; align-items: center; justify-content: space-between; }
+        .header h1 { font-size: 20px; font-weight: 600; }
+        .header-actions { display: flex; gap: 12px; }
+        .btn { padding: 8px 16px; border: none; border-radius: 8px; cursor: pointer; font-size: 14px; transition: all 0.2s; }
+        .btn-primary { background: white; color: #667eea; }
+        .btn-primary:hover { background: #f0f0f0; }
+        .btn-secondary { background: rgba(255,255,255,0.2); color: white; }
+        .btn-secondary:hover { background: rgba(255,255,255,0.3); }
+        .layout { display: flex; height: calc(100vh - 60px); }
+        .sidebar { width: 260px; background: white; border-right: 1px solid #e5e7eb; padding: 20px; overflow-y: auto; }
+        .sidebar h3 { font-size: 14px; color: #6b7280; margin-bottom: 12px; text-transform: uppercase; letter-spacing: 0.5px; }
+        .sidebar-section { margin-bottom: 24px; }
+        .filter-item { display: flex; align-items: center; gap: 8px; padding: 8px 12px; border-radius: 8px; cursor: pointer; transition: background 0.2s; }
+        .filter-item:hover { background: #f3f4f6; }
+        .filter-item input { accent-color: #667eea; }
+        .session-item { padding: 12px; border-radius: 8px; cursor: pointer; transition: all 0.2s; margin-bottom: 8px; }
+        .session-item:hover { background: #f3f4f6; }
+        .session-item.active { background: #ede9fe; border: 1px solid #a78bfa; }
+        .session-item .session-subject { font-size: 14px; font-weight: 500; color: #1f2937; }
+        .session-item .session-meta { font-size: 12px; color: #6b7280; margin-top: 4px; }
+        .main { flex: 1; overflow-y: auto; padding: 24px; }
+        .section { background: white; border-radius: 16px; padding: 24px; margin-bottom: 20px; box-shadow: 0 1px 3px rgba(0,0,0,0.08); }
+        .section-title { font-size: 18px; font-weight: 600; color: #1f2937; margin-bottom: 16px; display: flex; align-items: center; gap: 8px; }
+        .stats-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; }
+        .stat-card { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 20px; border-radius: 12px; text-align: center; }
+        .stat-card .value { font-size: 32px; font-weight: 700; }
+        .stat-card .label { font-size: 14px; opacity: 0.9; margin-top: 4px; }
+        .mastery-list { display: flex; flex-direction: column; gap: 12px; }
+        .mastery-item { display: flex; align-items: center; gap: 16px; }
+        .mastery-item .topic-name { width: 120px; font-size: 14px; color: #374151; }
+        .mastery-bar-bg { flex: 1; height: 8px; background: #e5e7eb; border-radius: 4px; overflow: hidden; }
+        .mastery-bar { height: 100%; border-radius: 4px; transition: width 0.5s ease; }
+        .mastery-item .score { width: 40px; text-align: right; font-size: 14px; font-weight: 600; }
+        .gap-list { display: flex; flex-direction: column; gap: 8px; }
+        .gap-item { padding: 12px 16px; border-radius: 10px; background: #fef3c7; border-left: 4px solid #f59e0b; cursor: pointer; transition: all 0.2s; }
+        .gap-item:hover { background: #fde68a; }
+        .gap-item.expanded { background: #fef3c7; }
+        .gap-item .gap-text { font-size: 14px; color: #92400e; }
+        .gap-item .gap-detail { display: none; margin-top: 8px; padding-top: 8px; border-top: 1px solid #fde68a; font-size: 13px; color: #78350f; }
+        .gap-item.expanded .gap-detail { display: block; }
+        .quiz-timeline { display: flex; flex-direction: column; gap: 12px; }
+        .quiz-item { display: flex; align-items: center; gap: 16px; padding: 12px; background: #f9fafb; border-radius: 10px; }
+        .quiz-item .quiz-time { font-size: 12px; color: #6b7280; width: 100px; }
+        .quiz-item .quiz-info { flex: 1; font-size: 14px; color: #374151; }
+        .quiz-item .quiz-score { font-size: 16px; font-weight: 600; }
+        .suggestion-list { display: flex; flex-direction: column; gap: 10px; }
+        .suggestion-item { display: flex; gap: 12px; padding: 12px; background: #f0fdf4; border-radius: 10px; border-left: 4px solid #10b981; }
+        .suggestion-item .icon { font-size: 18px; }
+        .suggestion-item .text { font-size: 14px; color: #065f46; line-height: 1.6; }
+        .empty-state { text-align: center; padding: 60px 20px; color: #6b7280; }
+        .empty-state .icon { font-size: 48px; margin-bottom: 16px; }
+        .loading { text-align: center; padding: 40px; color: #6b7280; }
+        .loading .spinner { width: 40px; height: 40px; border: 3px solid #e5e7eb; border-top-color: #667eea; border-radius: 50%; animation: spin 1s linear infinite; margin: 0 auto 16px; }
+        @keyframes spin { to { transform: rotate(360deg); } }
+        .tags { display: flex; flex-wrap: wrap; gap: 8px; }
+        .tag { padding: 4px 12px; border-radius: 20px; font-size: 13px; }
+        .tag-subject { background: #ede9fe; color: #667eea; }
+        .tag-topic { background: #dbeafe; color: #3b82f6; }
+        .tag-gap { background: #fef3c7; color: #f59e0b; }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <div style="display:flex;align-items:center;gap:12px;">
+            <span style="font-size:24px;">📊</span>
+            <h1>学情分析报告</h1>
+        </div>
+        <div class="header-actions">
+            <button class="btn btn-secondary" onclick="exportReport()">📥 导出报告</button>
+            <button class="btn btn-primary" onclick="window.location.href='/'">← 返回聊天</button>
+        </div>
+    </div>
+    <div class="layout">
+        <div class="sidebar">
+            <div class="sidebar-section">
+                <h3>学科筛选</h3>
+                <div id="subject-filters"></div>
+            </div>
+            <div class="sidebar-section">
+                <h3>知识点筛选</h3>
+                <div id="topic-filters"></div>
+            </div>
+            <div class="sidebar-section">
+                <h3>会话列表</h3>
+                <div id="session-list"></div>
+            </div>
+        </div>
+        <div class="main" id="main-content">
+            <div class="loading"><div class="spinner"></div>正在加载报告...</div>
+        </div>
+    </div>
+    <script>
+        const sessionId = new URLSearchParams(window.location.search).get('session_id') || localStorage.getItem('sessionId') || '';
+        let reportData = null;
+        let allSessions = [];
+
+        async function loadReport(sessionId) {
+            const main = document.getElementById('main-content');
+            main.innerHTML = '<div class="loading"><div class="spinner"></div>正在加载报告...</div>';
+
+            try {
+                const resp = await fetch('/api/report-data/' + sessionId);
+                reportData = await resp.json();
+                if (reportData.empty) {
+                    main.innerHTML = '<div class="empty-state"><div class="icon">📊</div><div>暂无学习数据，多提问来生成报告吧</div></div>';
+                    return;
+                }
+                renderReport();
+            } catch (e) {
+                main.innerHTML = '<div class="empty-state"><div class="icon">⚠️</div><div>加载报告失败，请重试</div></div>';
+            }
+        }
+
+        async function loadSessions() {
+            try {
+                const resp = await fetch('/api/sessions');
+                allSessions = resp.sessions || [];
+                renderSessionList();
+            } catch (e) { console.error(e); }
+        }
+
+        function renderSessionList() {
+            const container = document.getElementById('session-list');
+            if (!allSessions.length) {
+                container.innerHTML = '<div style="color:#9ca3af;font-size:13px;">暂无其他会话</div>';
+                return;
+            }
+            container.innerHTML = allSessions.map(s => `
+                <div class="session-item ${s.session_id === sessionId ? 'active' : ''}" onclick="switchSession('${s.session_id}')">
+                    <div class="session-subject">${(s.subject_history || []).join(' / ') || '综合'}</div>
+                    <div class="session-meta">${s.turn_count || 0}轮 · ${(s.current_topics || []).slice(0,2).join(', ')}</div>
+                </div>
+            `).join('');
+        }
+
+        function switchSession(sid) {
+            const url = new URL(window.location);
+            url.searchParams.set('session_id', sid);
+            window.location.href = url.toString();
+        }
+
+        function renderFilters() {
+            const subjects = reportData.subject_history || [];
+            const topics = reportData.current_topics || [];
+            document.getElementById('subject-filters').innerHTML = subjects.length
+                ? subjects.map(s => `<label class="filter-item"><input type="checkbox" checked onchange="filterReport()"> ${s}</label>`).join('')
+                : '<div style="color:#9ca3af;font-size:13px;">暂无学科数据</div>';
+            document.getElementById('topic-filters').innerHTML = topics.length
+                ? topics.map(t => `<label class="filter-item"><input type="checkbox" checked onchange="filterReport()"> ${t}</label>`).join('')
+                : '<div style="color:#9ca3af;font-size:13px;">暂无知识点数据</div>';
+        }
+
+        function filterReport() { /* placeholder for future filtering */ }
+
+        function getScoreColor(score) {
+            if (score >= 80) return '#10b981';
+            if (score >= 60) return '#f59e0b';
+            return '#ef4444';
+        }
+
+        function formatDate(iso) {
+            if (!iso) return '-';
+            const d = new Date(iso);
+            return d.toLocaleDateString('zh-CN') + ' ' + d.toLocaleTimeString('zh-CN', {hour:'2-digit', minute:'2-digit'});
+        }
+
+        function renderReport() {
+            const d = reportData;
+            renderFilters();
+
+            // 学科标签
+            const subjectTags = (d.subject_history || []).map(s => `<span class="tag tag-subject">${s}</span>`).join('');
+            // 知识点标签
+            const topicTags = (d.current_topics || []).map(t => `<span class="tag tag-topic">${t}</span>`).join('');
+            // 薄弱点标签
+            const gapTags = (d.knowledge_gaps || []).map(g => `<span class="tag tag-gap">${g}</span>`).join('');
+
+            // 掌握度列表
+            const masteryHtml = Object.entries(d.mastery_levels || {}).length
+                ? Object.entries(d.mastery_levels).map(([topic, score]) => `
+                    <div class="mastery-item">
+                        <div class="topic-name">${topic}</div>
+                        <div class="mastery-bar-bg"><div class="mastery-bar" style="width:${score}%;background:${getScoreColor(score)}"></div></div>
+                        <div class="score" style="color:${getScoreColor(score)}">${score}</div>
+                    </div>
+                `).join('')
+                : '<div style="color:#9ca3af;font-size:13px;">暂无掌握度数据</div>';
+
+            // 薄弱点详情
+            const gapHtml = (d.knowledge_gaps || []).length
+                ? d.knowledge_gaps.map((g, i) => `
+                    <div class="gap-item" onclick="this.classList.toggle('expanded')">
+                        <div class="gap-text">⚠️ ${g}</div>
+                        <div class="gap-detail">💡 建议加强该知识点的练习和复习</div>
+                    </div>
+                `).join('')
+                : '<div style="color:#10b981;font-size:14px;">🎉 暂无明显薄弱点，继续保持！</div>';
+
+            // 练习记录
+            const quizSummary = d.quiz_summary || {};
+            const quizHtml = quizSummary.total_quizzes > 0
+                ? `<div class="quiz-timeline">${quizSummary.records.map(r => `
+                    <div class="quiz-item">
+                        <div class="quiz-time">${formatDate(r.timestamp)}</div>
+                        <div class="quiz-info">${r.total_count}题 · 正确${r.correct_count}题</div>
+                        <div class="quiz-score" style="color:${getScoreColor(r.accuracy * 100)}">${Math.round(r.accuracy * 100)}%</div>
+                    </div>
+                `).join('')}</div>`
+                : '<div style="color:#9ca3af;font-size:13px;">暂无练习记录</div>';
+
+            // 改进建议
+            const suggestionHtml = (d.improvement_suggestions || []).length
+                ? d.improvement_suggestions.map(s => `<div class="suggestion-item"><span class="icon">💡</span><div class="text">${s}</div></div>`).join('')
+                : '';
+
+            // 优点
+            const strengthHtml = (d.strengths || []).length
+                ? d.strengths.map(s => `<div class="suggestion-item" style="background:#eff6ff;border-left-color:#3b82f6"><span class="icon">⭐</span><div class="text">${s}</div></div>`).join('')
+                : '';
+
+            // 弱点
+            const weaknessHtml = (d.weaknesses || []).length
+                ? d.weaknesses.map(s => `<div class="suggestion-item" style="background:#fff7ed;border-left-color:#f97316"><span class="icon">📌</span><div class="text">${s}</div></div>`).join('')
+                : '';
+
+            document.getElementById('main-content').innerHTML = `
+                <!-- 概览 -->
+                <div class="section">
+                    <div class="section-title">📊 学习概览</div>
+                    <div class="stats-grid">
+                        <div class="stat-card"><div class="value">${d.turn_count || 0}</div><div class="label">对话轮次</div></div>
+                        <div class="stat-card"><div class="value">${(d.subject_history || []).length}</div><div class="label">学科数量</div></div>
+                        <div class="stat-card"><div class="value">${(d.current_topics || []).length}</div><div class="label">知识点</div></div>
+                        <div class="stat-card"><div class="value">${(d.knowledge_gaps || []).length}</div><div class="label">薄弱点</div></div>
+                    </div>
+                    <div style="margin-top:16px">
+                        <div style="font-size:14px;color:#6b7280;margin-bottom:8px">学科</div>
+                        <div class="tags">${subjectTags}</div>
+                    </div>
+                    <div style="margin-top:12px">
+                        <div style="font-size:14px;color:#6b7280;margin-bottom:8px">知识点</div>
+                        <div class="tags">${topicTags}</div>
+                    </div>
+                    ${gapTags ? `<div style="margin-top:12px"><div style="font-size:14px;color:#6b7280;margin-bottom:8px">薄弱点</div><div class="tags">${gapTags}</div></div>` : ''}
+                </div>
+
+                <!-- 知识掌握度 -->
+                <div class="section">
+                    <div class="section-title">📈 知识掌握度</div>
+                    <div class="mastery-list">${masteryHtml}</div>
+                </div>
+
+                <!-- 薄弱点分析 -->
+                <div class="section">
+                    <div class="section-title">⚠️ 薄弱点分析</div>
+                    <div class="gap-list">${gapHtml}</div>
+                </div>
+
+                <!-- 练习记录 -->
+                <div class="section">
+                    <div class="section-title">📝 练习记录</div>
+                    ${quizHtml}
+                </div>
+
+                <!-- 优点与弱点 -->
+                <div class="section">
+                    <div class="section-title">🎯 学习分析</div>
+                    ${strengthHtml ? `<div style="margin-bottom:12px"><div style="font-size:14px;color:#6b7280;margin-bottom:8px">优点</div>${strengthHtml}</div>` : ''}
+                    ${weaknessHtml ? `<div style="margin-bottom:12px"><div style="font-size:14px;color:#6b7280;margin-bottom:8px">待改进</div>${weaknessHtml}</div>` : ''}
+                </div>
+
+                <!-- 改进建议 -->
+                <div class="section">
+                    <div class="section-title">💡 改进建议</div>
+                    ${suggestionHtml || '<div style="color:#9ca3af;font-size:13px;">暂无建议</div>'}
+                    ${d.next_steps ? `<div style="margin-top:12px;padding:12px;background:#f0f9ff;border-radius:10px;font-size:14px;color:#0c4a6e"><strong>下一步建议：</strong>${d.next_steps}</div>` : ''}
+                </div>
+
+                <!-- 对话摘要 -->
+                ${d.conversation_summary ? `<div class="section">
+                    <div class="section-title">📋 对话摘要</div>
+                    <div style="font-size:14px;color:#374151;line-height:1.8">${d.conversation_summary}</div>
+                </div>` : ''}
+            `;
+        }
+
+        function exportReport() {
+            if (!reportData) return;
+            const d = reportData;
+            const lines = [
+                '# 学情分析报告',
+                '',
+                `**生成时间**: ${new Date().toLocaleString('zh-CN')}`,
+                `**会话ID**: ${sessionId}`,
+                '',
+                '## 学习概览',
+                `- 对话轮次: ${d.turn_count || 0}`,
+                `- 学科: ${(d.subject_history || []).join(', ') || '无'}`,
+                `- 知识点: ${(d.current_topics || []).join(', ') || '无'}`,
+                `- 薄弱点: ${(d.knowledge_gaps || []).length} 个`,
+                '',
+                '## 知识掌握度',
+                ...Object.entries(d.mastery_levels || {}).map(([t, s]) => `- ${t}: ${s}分`),
+                '',
+                '## 薄弱点分析',
+                ...((d.knowledge_gaps || []).map(g => `- ${g}`)),
+                '',
+                '## 练习记录',
+                ...(d.quiz_summary?.records || []).map(r => `- ${formatDate(r.timestamp)}: ${r.correct_count}/${r.total_count} (${Math.round(r.accuracy*100)}%)`),
+                '',
+                '## 学习分析',
+                '### 优点',
+                ...((d.strengths || []).map(s => `- ${s}`)),
+                '### 待改进',
+                ...((d.weaknesses || []).map(s => `- ${s}`)),
+                '',
+                '## 改进建议',
+                ...((d.improvement_suggestions || []).map(s => `- ${s}`)),
+                '',
+                '## 对话摘要',
+                d.conversation_summary || '无',
+            ];
+            const blob = new Blob([lines.join('\n')], { type: 'text/markdown;charset=utf-8' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = `学情分析报告_${new Date().toISOString().slice(0,10)}.md`;
+            a.click();
+            URL.revokeObjectURL(url);
+        }
+
+        // 初始化
+        loadSessions();
+        if (sessionId) {
+            loadReport(sessionId);
+        } else {
+            document.getElementById('main-content').innerHTML = '<div class="empty-state"><div class="icon">🔍</div><div>请先选择一个会话</div></div>';
+        }
+    </script>
+</body>
+</html>"""
 
 
 @app.get("/export-note/{session_id}")
@@ -1133,51 +1637,12 @@ async def root():
         }
 
         // ============ 功能：学习报告 ============
-        async function showStudyReport() {
-            const loadingEl = document.createElement('div');
-            loadingEl.className = 'message assistant';
-            loadingEl.innerHTML = '<div class="avatar">🤖</div><div class="bubble loading">正在生成学习报告...</div>';
-            messagesEl.appendChild(loadingEl);
-            messagesEl.scrollTop = messagesEl.scrollHeight;
-
-            try {
-                const response = await fetch(`/study-report/${sessionId}`);
-                const data = await response.json();
-                loadingEl.remove();
-
-                const msgEl = document.createElement('div');
-                msgEl.className = 'message assistant';
-                msgEl.innerHTML = `<div class="avatar">🤖</div><div class="bubble"></div>`;
-                messagesEl.appendChild(msgEl);
-
-                const bubble = msgEl.querySelector('.bubble');
-                const panel = document.createElement('div');
-                panel.className = 'report-panel';
-
-                if (data.empty) {
-                    panel.innerHTML = `<div class="empty-state"><div class="icon">📊</div><div>${data.message}</div></div>`;
-                } else {
-                    let topicsHtml = (data.current_topics || []).map(t => `<span class="report-topic">${t}</span>`).join('');
-                    let gapsHtml = (data.knowledge_gaps || []).map(g => `<span class="report-gap">${g}</span>`).join('');
-                    let subjectsHtml = (data.subject_history || []).map(s => `<span class="report-topic">${s}</span>`).join('');
-
-                    panel.innerHTML = `
-                        <div class="report-stat">
-                            <div><div class="value">${data.turn_count}</div><div class="label">对话轮次</div></div>
-                            <div><div class="value">${subjectsHtml || '-'}</div><div class="label">学科</div></div>
-                        </div>
-                        ${topicsHtml ? `<div class="report-topics"><div class="label">当前知识点</div>${topicsHtml}</div>` : ''}
-                        ${gapsHtml ? `<div class="report-topics"><div class="label">可能薄弱的地方</div>${gapsHtml}</div>` : ''}
-                        ${data.conversation_summary ? `<div class="report-topics"><div class="label">对话摘要</div><div style="font-size:13px;color:#6b7280;margin-top:4px">${data.conversation_summary}</div></div>` : ''}
-                    `;
-                }
-
-                bubble.appendChild(panel);
-                messagesEl.scrollTop = messagesEl.scrollHeight;
-            } catch (error) {
-                loadingEl.remove();
-                addMessage('assistant', '获取学习报告失败，请重试。');
+        function showStudyReport() {
+            if (!sessionId) {
+                addMessage('assistant', '请先开始对话，生成学习数据后再查看报告。');
+                return;
             }
+            window.location.href = `/report/${sessionId}`;
         }
 
         // ============ 功能：导出笔记 ============
