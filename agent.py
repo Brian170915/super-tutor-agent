@@ -33,6 +33,13 @@ class QuizRequest(BaseModel):
     count: int = 5
 
 
+class SubmitQuizRequest(BaseModel):
+    session_id: str = ""
+    questions: list = []
+    answers: dict = {}
+    correct_count: int = 0
+
+
 app = FastAPI(
     title="超级教育智能体",
     description="基于 LangGraph 的初中教育智能体 - 答疑 + RAG + 思维导图 + 上下文管理",
@@ -342,6 +349,32 @@ async def generate_quiz_endpoint(request: QuizRequest):
     }
 
 
+@app.post("/submit-quiz")
+async def submit_quiz_endpoint(request: SubmitQuizRequest):
+    """提交答题结果并保存"""
+    session_id = request.session_id or str(__import__("uuid").uuid4())
+    _session_last_active[session_id] = time.time()
+
+    record_store = get_record_store()
+    record = record_store.save_quiz_result(
+        session_id=session_id,
+        questions=request.questions,
+        answers=request.answers,
+        correct_count=request.correct_count,
+    )
+
+    # 同步到跨轮次追踪器
+    tracker = get_tracker()
+    tracker.add_quiz_record(session_id, record)
+
+    return {
+        "session_id": session_id,
+        "total_count": record["total_count"],
+        "correct_count": record["correct_count"],
+        "accuracy": record["accuracy"],
+    }
+
+
 @app.get("/study-report/{session_id}")
 async def study_report_endpoint(session_id: str):
     """获取学习报告数据"""
@@ -405,6 +438,12 @@ async def report_data_endpoint(session_id: str):
     except Exception:
         pass
 
+    # 如果 tracker 中 subject_history 为空，从练习记录中推断学科
+    if not st.subject_history:
+        inferred = record_store.infer_subjects_from_records(session_id)
+        if inferred:
+            st.subject_history = inferred
+
     has_data = st.turn_count > 0 or st.current_topics or st.subject_history
     if not has_data:
         return {
@@ -421,6 +460,7 @@ async def report_data_endpoint(session_id: str):
             "strengths": [],
             "weaknesses": [],
             "next_steps": "",
+            "grade_info": {},
         }
 
     # 获取练习记录
@@ -486,6 +526,7 @@ async def report_data_endpoint(session_id: str):
         "weaknesses": weaknesses,
         "next_steps": next_steps,
         "session_start_time": st.session_start_time,
+        "grade_info": _build_grade_info(st.current_topics),
     }
 
 
@@ -516,8 +557,16 @@ def _calculate_mastery(st, quiz_summary: dict) -> dict:
 async def list_sessions_endpoint():
     """获取所有会话列表"""
     tracker = get_tracker()
+    record_store = get_record_store()
     sessions = []
+
+    # 从 tracker 获取已有会话
     for sid, st in tracker._trackers.items():
+        if not st.subject_history:
+            inferred = record_store.infer_subjects_from_records(sid)
+            if inferred:
+                st.subject_history = inferred
+        quiz_summary = record_store.get_session_summary(sid)
         sessions.append({
             "session_id": sid,
             "subject_history": st.subject_history,
@@ -525,10 +574,147 @@ async def list_sessions_endpoint():
             "turn_count": st.turn_count,
             "conversation_summary": st.conversation_summary[:100] if st.conversation_summary else "",
             "session_start_time": st.session_start_time,
+            "last_quiz_score": st.last_quiz_score,
+            "quiz_summary": quiz_summary,
         })
-    # 按创建时间排序
+
+    # 补充数据库中存在的、但 tracker 中已超时的会话
+    db_sids = set(record_store.get_all_session_ids())
+    tracker_sids = set(tracker._trackers.keys())
+    for sid in db_sids - tracker_sids:
+        quiz_summary = record_store.get_session_summary(sid)
+        subject_history = record_store.infer_subjects_from_records(sid)
+        records = record_store.get_session_records(sid)
+        sessions.append({
+            "session_id": sid,
+            "subject_history": subject_history,
+            "current_topics": [],
+            "turn_count": 0,
+            "conversation_summary": "",
+            "session_start_time": records[0]["timestamp"] if records else "",
+            "last_quiz_score": None,
+            "quiz_summary": quiz_summary,
+        })
+
     sessions.sort(key=lambda x: x.get("session_start_time", ""), reverse=True)
     return {"sessions": sessions}
+
+
+@app.get("/api/sessions-summary")
+async def sessions_summary_endpoint():
+    """获取所有会话的聚合统计摘要"""
+    tracker = get_tracker()
+    record_store = get_record_store()
+
+    # 优先从 tracker 获取，fallback 到数据库
+    sessions = record_store.get_all_session_summaries(tracker)
+    if not sessions:
+        # 如果 tracker 全空，直接从数据库获取
+        session_ids = record_store.get_all_session_ids()
+        for sid in session_ids:
+            quiz_summary = record_store.get_session_summary(sid)
+            subject_history = record_store.infer_subjects_from_records(sid)
+            records = record_store.get_session_records(sid)
+            sessions.append({
+                "session_id": sid,
+                "subject_history": subject_history,
+                "turn_count": 0,
+                "last_quiz_score": None,
+                "quiz_summary": quiz_summary,
+                "session_start_time": records[0]["timestamp"] if records else "",
+            })
+
+    sessions.sort(key=lambda x: x.get("session_start_time", ""), reverse=True)
+
+    # 按学科聚合
+    subject_stats = {}
+    for s in sessions:
+        for subj in s["subject_history"]:
+            if subj not in subject_stats:
+                subject_stats[subj] = {"total_turns": 0, "total_quizzes": 0, "total_questions": 0, "total_correct": 0, "sessions": 0}
+            subject_stats[subj]["total_turns"] += s["turn_count"]
+            subject_stats[subj]["sessions"] += 1
+            qs = s["quiz_summary"]
+            subject_stats[subj]["total_quizzes"] += qs.get("total_quizzes", 0)
+            subject_stats[subj]["total_questions"] += qs.get("total_questions", 0)
+            subject_stats[subj]["total_correct"] += qs.get("total_correct", 0)
+
+    for subj in subject_stats:
+        qs = subject_stats[subj]
+        qs["avg_accuracy"] = qs["total_correct"] / qs["total_questions"] if qs["total_questions"] > 0 else 0
+
+    return {"sessions": sessions, "subject_stats": subject_stats}
+
+
+@app.get("/api/subject-statistics")
+async def subject_statistics_endpoint(subject: str = Query(..., description="学科名称")):
+    """按学科聚合所有会话的学习数据"""
+    tracker = get_tracker()
+    record_store = get_record_store()
+
+    matching_sessions = []
+    for sid, st in tracker._trackers.items():
+        if subject in st.subject_history:
+            quiz_summary = record_store.get_session_summary(sid)
+            # 计算该学科下的知识点掌握度
+            mastery = _calculate_mastery(st, quiz_summary)
+            # 匹配知识点到年级
+            grade_info = _build_grade_info(st.current_topics)
+            matching_sessions.append({
+                "session_id": sid,
+                "turn_count": st.turn_count,
+                "current_topics": st.current_topics,
+                "knowledge_gaps": st.knowledge_gaps,
+                "mastery_levels": mastery,
+                "grade_info": grade_info,
+                "quiz_summary": quiz_summary,
+                "last_quiz_score": st.last_quiz_score,
+                "session_start_time": st.session_start_time,
+            })
+
+    matching_sessions.sort(key=lambda x: x.get("session_start_time", ""), reverse=True)
+
+    # 聚合统计
+    all_topics = {}
+    for s in matching_sessions:
+        for topic, score in s["mastery_levels"].items():
+            if topic not in all_topics:
+                all_topics[topic] = {"scores": [], "grade": s["grade_info"].get(topic, "")}
+            all_topics[topic]["scores"].append(score)
+
+    aggregated_mastery = {}
+    for topic, data in all_topics.items():
+        scores = data["scores"]
+        aggregated_mastery[topic] = {
+            "avg_score": round(sum(scores) / len(scores)) if scores else 0,
+            "sessions": len(scores),
+            "grade": data["grade"],
+        }
+
+    total_quizzes = sum(s["quiz_summary"].get("total_quizzes", 0) for s in matching_sessions)
+    total_questions = sum(s["quiz_summary"].get("total_questions", 0) for s in matching_sessions)
+    total_correct = sum(s["quiz_summary"].get("total_correct", 0) for s in matching_sessions)
+
+    return {
+        "subject": subject,
+        "sessions": matching_sessions,
+        "aggregated_mastery": aggregated_mastery,
+        "total_quizzes": total_quizzes,
+        "total_questions": total_questions,
+        "total_correct": total_correct,
+        "avg_accuracy": total_correct / total_questions if total_questions > 0 else 0,
+    }
+
+
+def _build_grade_info(topics: list) -> dict:
+    """根据 KNOWLEDGE_STRUCTURE 构建知识点 → 年级的映射"""
+    grade_info = {}
+    for subject, grades in KNOWLEDGE_STRUCTURE.items():
+        for grade, grade_topics in grades.items():
+            for topic in grade_topics:
+                if topic in topics:
+                    grade_info[topic] = grade
+    return grade_info
 
 
 @app.get("/report/{session_id}", response_class=HTMLResponse)
@@ -554,16 +740,21 @@ async def report_page(session_id: str):
         .btn-secondary:hover { background: rgba(255,255,255,0.3); }
         .layout { display: flex; height: calc(100vh - 60px); }
         .sidebar { width: 260px; background: white; border-right: 1px solid #e5e7eb; padding: 20px; overflow-y: auto; }
-        .sidebar h3 { font-size: 14px; color: #6b7280; margin-bottom: 12px; text-transform: uppercase; letter-spacing: 0.5px; }
+        .sidebar h3 { font-size: 14px; color: #6b7280; margin-bottom: 12px; text-transform: uppercase; letter-spacing: 0.5px; display: flex; align-items: center; justify-content: space-between; }
         .sidebar-section { margin-bottom: 24px; }
         .filter-item { display: flex; align-items: center; gap: 8px; padding: 8px 12px; border-radius: 8px; cursor: pointer; transition: background 0.2s; }
         .filter-item:hover { background: #f3f4f6; }
         .filter-item input { accent-color: #667eea; }
-        .session-item { padding: 12px; border-radius: 8px; cursor: pointer; transition: all 0.2s; margin-bottom: 8px; }
+        .filter-item.checked { background: #ede9fe; color: #667eea; }
+        .filter-item.checked input { accent-color: #667eea; }
+        .filter-clear { font-size: 12px; color: #9ca3af; cursor: pointer; text-decoration: underline; }
+        .filter-clear:hover { color: #667eea; }
+        .session-item { padding: 12px; border-radius: 8px; cursor: pointer; transition: all 0.2s; margin-bottom: 8px; border: 1px solid transparent; }
         .session-item:hover { background: #f3f4f6; }
-        .session-item.active { background: #ede9fe; border: 1px solid #a78bfa; }
+        .session-item.active { background: #ede9fe; border-color: #a78bfa; }
         .session-item .session-subject { font-size: 14px; font-weight: 500; color: #1f2937; }
         .session-item .session-meta { font-size: 12px; color: #6b7280; margin-top: 4px; }
+        .session-item .session-quiz { font-size: 11px; color: #10b981; margin-top: 2px; }
         .main { flex: 1; overflow-y: auto; padding: 24px; }
         .section { background: white; border-radius: 16px; padding: 24px; margin-bottom: 20px; box-shadow: 0 1px 3px rgba(0,0,0,0.08); }
         .section-title { font-size: 18px; font-weight: 600; color: #1f2937; margin-bottom: 16px; display: flex; align-items: center; gap: 8px; }
@@ -573,9 +764,11 @@ async def report_page(session_id: str):
         .stat-card .label { font-size: 14px; opacity: 0.9; margin-top: 4px; }
         .mastery-list { display: flex; flex-direction: column; gap: 12px; }
         .mastery-item { display: flex; align-items: center; gap: 16px; }
-        .mastery-item .topic-name { width: 120px; font-size: 14px; color: #374151; }
+        .mastery-item .topic-label { display: flex; align-items: center; gap: 8px; width: 160px; flex-shrink: 0; }
+        .grade-badge { font-size: 11px; padding: 2px 6px; border-radius: 4px; background: #e0e7ff; color: #4338ca; font-weight: 500; white-space: nowrap; }
+        .topic-name { font-size: 14px; color: #374151; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
         .mastery-bar-bg { flex: 1; height: 8px; background: #e5e7eb; border-radius: 4px; overflow: hidden; }
-        .mastery-bar { height: 100%; border-radius: 4px; transition: width 0.5s ease; }
+        .mastery-bar { height: 100%; border-radius: 4px; transition: width 0.8s cubic-bezier(0.4, 0, 0.2, 1); }
         .mastery-item .score { width: 40px; text-align: right; font-size: 14px; font-weight: 600; }
         .gap-list { display: flex; flex-direction: column; gap: 8px; }
         .gap-item { padding: 12px 16px; border-radius: 10px; background: #fef3c7; border-left: 4px solid #f59e0b; cursor: pointer; transition: all 0.2s; }
@@ -603,6 +796,20 @@ async def report_page(session_id: str):
         .tag-subject { background: #ede9fe; color: #667eea; }
         .tag-topic { background: #dbeafe; color: #3b82f6; }
         .tag-gap { background: #fef3c7; color: #f59e0b; }
+        /* 跨会话学科汇总 */
+        .cross-session-summary { background: white; border-radius: 16px; padding: 20px 24px; margin-bottom: 20px; box-shadow: 0 1px 3px rgba(0,0,0,0.08); }
+        .cross-summary-title { font-size: 16px; font-weight: 600; color: #1f2937; margin-bottom: 16px; display: flex; align-items: center; gap: 8px; }
+        .cross-summary-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 12px; }
+        .cross-subject-card { background: linear-gradient(135deg, #f8fafc 0%, #f0f4ff 100%); border: 1px solid #e0e7ff; border-radius: 12px; padding: 16px; cursor: pointer; transition: all 0.2s; }
+        .cross-subject-card:hover { border-color: #667eea; transform: translateY(-1px); box-shadow: 0 4px 12px rgba(102,126,234,0.15); }
+        .cross-subject-card .subj-name { font-size: 16px; font-weight: 600; color: #1f2937; margin-bottom: 8px; }
+        .cross-subject-card .subj-stats { display: flex; flex-wrap: wrap; gap: 8px; font-size: 12px; color: #6b7280; }
+        .cross-subject-card .subj-stat { display: flex; align-items: center; gap: 4px; }
+        .cross-subject-card .subj-stat strong { color: #667eea; }
+        .filter-active-banner { background: #ede9fe; border: 1px solid #a78bfa; border-radius: 10px; padding: 10px 16px; margin-bottom: 16px; display: flex; align-items: center; justify-content: space-between; font-size: 13px; color: #667eea; }
+        .filter-active-banner .clear-btn { background: #a78bfa; color: white; border: none; padding: 4px 12px; border-radius: 6px; cursor: pointer; font-size: 12px; }
+        .filter-active-banner .clear-btn:hover { background: #667eea; }
+        .hidden { display: none !important; }
     </style>
 </head>
 <body>
@@ -619,15 +826,11 @@ async def report_page(session_id: str):
     <div class="layout">
         <div class="sidebar">
             <div class="sidebar-section">
-                <h3>学科筛选</h3>
+                <h3>学科筛选 <span class="filter-clear" onclick="toggleAllSubjects(false)">清空</span></h3>
                 <div id="subject-filters"></div>
             </div>
             <div class="sidebar-section">
-                <h3>知识点筛选</h3>
-                <div id="topic-filters"></div>
-            </div>
-            <div class="sidebar-section">
-                <h3>会话列表</h3>
+                <h3>会话列表 <span class="filter-clear" onclick="showAllSessions()">全部</span></h3>
                 <div id="session-list"></div>
             </div>
         </div>
@@ -639,11 +842,14 @@ async def report_page(session_id: str):
         const sessionId = new URLSearchParams(window.location.search).get('session_id') || localStorage.getItem('sessionId') || '';
         let reportData = null;
         let allSessions = [];
+        let sessionsSummary = null;
+        let activeSubjects = new Set();   // 当前激活的学科
+        let activeTopics = new Set();     // 当前激活的知识点
+        let activeSessionId = null;       // 当前激活的会话（null = 全部）
 
         async function loadReport(sessionId) {
             const main = document.getElementById('main-content');
             main.innerHTML = '<div class="loading"><div class="spinner"></div>正在加载报告...</div>';
-
             try {
                 const resp = await fetch('/api/report-data/' + sessionId);
                 reportData = await resp.json();
@@ -665,38 +871,90 @@ async def report_page(session_id: str):
             } catch (e) { console.error(e); }
         }
 
+        async function loadSessionsSummary() {
+            try {
+                const resp = await fetch('/api/sessions-summary');
+                sessionsSummary = await resp.json();
+            } catch (e) { console.error(e); }
+        }
+
         function renderSessionList() {
             const container = document.getElementById('session-list');
             if (!allSessions.length) {
                 container.innerHTML = '<div style="color:#9ca3af;font-size:13px;">暂无其他会话</div>';
                 return;
             }
-            container.innerHTML = allSessions.map(s => `
-                <div class="session-item ${s.session_id === sessionId ? 'active' : ''}" onclick="switchSession('${s.session_id}')">
+            container.innerHTML = allSessions.map(s => {
+                const isActive = activeSessionId === s.session_id || (!activeSessionId && s.session_id === sessionId);
+                const quizScore = s.last_quiz_score != null ? Math.round(s.last_quiz_score * 100) + '%' : '';
+                return `
+                <div class="session-item ${isActive ? 'active' : ''}" onclick="switchSession('${s.session_id}')">
                     <div class="session-subject">${(s.subject_history || []).join(' / ') || '综合'}</div>
                     <div class="session-meta">${s.turn_count || 0}轮 · ${(s.current_topics || []).slice(0,2).join(', ')}</div>
-                </div>
-            `).join('');
+                    ${quizScore ? `<div class="session-quiz">最近练习: ${quizScore}</div>` : ''}
+                </div>`;
+            }).join('');
         }
 
         function switchSession(sid) {
+            activeSessionId = sid;
             const url = new URL(window.location);
             url.searchParams.set('session_id', sid);
             window.location.href = url.toString();
         }
 
-        function renderFilters() {
-            const subjects = reportData.subject_history || [];
-            const topics = reportData.current_topics || [];
-            document.getElementById('subject-filters').innerHTML = subjects.length
-                ? subjects.map(s => `<label class="filter-item"><input type="checkbox" checked onchange="filterReport()"> ${s}</label>`).join('')
-                : '<div style="color:#9ca3af;font-size:13px;">暂无学科数据</div>';
-            document.getElementById('topic-filters').innerHTML = topics.length
-                ? topics.map(t => `<label class="filter-item"><input type="checkbox" checked onchange="filterReport()"> ${t}</label>`).join('')
-                : '<div style="color:#9ca3af;font-size:13px;">暂无知识点数据</div>';
+        function showAllSessions() {
+            activeSessionId = null;
+            const url = new URL(window.location);
+            url.searchParams.set('session_id', sessionId);
+            window.location.href = url.toString();
         }
 
-        function filterReport() { /* placeholder for future filtering */ }
+        // 初始化所有学科为选中状态
+        function initSubjectFilters() {
+            activeSubjects = new Set((reportData.subject_history || []).slice());
+            renderSubjectFilters();
+        }
+
+        function renderSubjectFilters() {
+            const subjects = reportData.subject_history || [];
+            const container = document.getElementById('subject-filters');
+            if (!subjects.length) {
+                container.innerHTML = '<div style="color:#9ca3af;font-size:13px;">暂无学科数据</div>';
+                return;
+            }
+            container.innerHTML = subjects.map(s => {
+                const checked = activeSubjects.has(s) ? 'checked' : '';
+                return `<label class="filter-item ${checked ? 'checked' : ''}">
+                    <input type="checkbox" ${checked} onchange="toggleSubject('${s}')"> ${s}
+                </label>`;
+            }).join('');
+        }
+
+        function toggleSubject(subject) {
+            if (activeSubjects.has(subject)) {
+                activeSubjects.delete(subject);
+            } else {
+                activeSubjects.add(subject);
+            }
+            renderSubjectFilters();
+            applyFilters();
+        }
+
+        function toggleAllSubjects(selectAll) {
+            const subjects = reportData.subject_history || [];
+            if (selectAll) {
+                activeSubjects = new Set(subjects);
+            } else {
+                activeSubjects = new Set();
+            }
+            renderSubjectFilters();
+            applyFilters();
+        }
+
+        function applyFilters() {
+            renderReport();
+        }
 
         function getScoreColor(score) {
             if (score >= 80) return '#10b981';
@@ -712,29 +970,50 @@ async def report_page(session_id: str):
 
         function renderReport() {
             const d = reportData;
-            renderFilters();
+            initSubjectFilters();
+
+            // 获取筛选后的数据
+            const filteredTopics = getFilteredTopics();
+            const filteredMastery = getFilteredMastery();
+            const filteredGaps = getFilteredGaps();
+
+            // 显示筛选状态横幅
+            let filterBanner = '';
+            if (activeSubjects.size > 0 && activeSubjects.size < (d.subject_history || []).length) {
+                const labels = Array.from(activeSubjects).join('、');
+                filterBanner = `<div class="filter-active-banner">
+                    <span>🔍 已筛选学科: <strong>${labels}</strong></span>
+                    <button class="clear-btn" onclick="toggleAllSubjects(true)">清除筛选</button>
+                </div>`;
+            }
 
             // 学科标签
             const subjectTags = (d.subject_history || []).map(s => `<span class="tag tag-subject">${s}</span>`).join('');
-            // 知识点标签
-            const topicTags = (d.current_topics || []).map(t => `<span class="tag tag-topic">${t}</span>`).join('');
+            // 知识点标签（带年级）
+            const gradeInfo = d.grade_info || {};
+            const topicTags = (d.current_topics || []).map(t => {
+                const grade = gradeInfo[t] ? `<span class="grade-badge">${gradeInfo[t]}</span>` : '';
+                return `${grade}<span class="tag tag-topic">${t}</span>`;
+            }).join('');
             // 薄弱点标签
             const gapTags = (d.knowledge_gaps || []).map(g => `<span class="tag tag-gap">${g}</span>`).join('');
 
-            // 掌握度列表
-            const masteryHtml = Object.entries(d.mastery_levels || {}).length
-                ? Object.entries(d.mastery_levels).map(([topic, score]) => `
+            // 掌握度列表（带年级标签，支持筛选）
+            const masteryHtml = Object.entries(filteredMastery).length
+                ? Object.entries(filteredMastery).map(([topic, score]) => {
+                    const grade = gradeInfo[topic] ? `<span class="grade-badge">${gradeInfo[topic]}</span>` : '';
+                    return `
                     <div class="mastery-item">
-                        <div class="topic-name">${topic}</div>
+                        <div class="topic-label">${grade}<span class="topic-name">${topic}</span></div>
                         <div class="mastery-bar-bg"><div class="mastery-bar" style="width:${score}%;background:${getScoreColor(score)}"></div></div>
                         <div class="score" style="color:${getScoreColor(score)}">${score}</div>
-                    </div>
-                `).join('')
+                    </div>`;
+                }).join('')
                 : '<div style="color:#9ca3af;font-size:13px;">暂无掌握度数据</div>';
 
-            // 薄弱点详情
-            const gapHtml = (d.knowledge_gaps || []).length
-                ? d.knowledge_gaps.map((g, i) => `
+            // 薄弱点详情（支持筛选）
+            const gapHtml = filteredGaps.length
+                ? filteredGaps.map((g, i) => `
                     <div class="gap-item" onclick="this.classList.toggle('expanded')">
                         <div class="gap-text">⚠️ ${g}</div>
                         <div class="gap-detail">💡 建议加强该知识点的练习和复习</div>
@@ -769,15 +1048,25 @@ async def report_page(session_id: str):
                 ? d.weaknesses.map(s => `<div class="suggestion-item" style="background:#fff7ed;border-left-color:#f97316"><span class="icon">📌</span><div class="text">${s}</div></div>`).join('')
                 : '';
 
+            // 跨会话学科汇总
+            const crossSummaryHtml = renderCrossSessionSummary();
+
+            // 统计数字（根据筛选更新）
+            const activeSubjectCount = activeSubjects.size > 0 ? activeSubjects.size : (d.subject_history || []).length;
+            const activeTopicCount = filteredTopics.length;
+
             document.getElementById('main-content').innerHTML = `
+                ${filterBanner}
+                ${crossSummaryHtml}
+
                 <!-- 概览 -->
                 <div class="section">
                     <div class="section-title">📊 学习概览</div>
                     <div class="stats-grid">
                         <div class="stat-card"><div class="value">${d.turn_count || 0}</div><div class="label">对话轮次</div></div>
-                        <div class="stat-card"><div class="value">${(d.subject_history || []).length}</div><div class="label">学科数量</div></div>
-                        <div class="stat-card"><div class="value">${(d.current_topics || []).length}</div><div class="label">知识点</div></div>
-                        <div class="stat-card"><div class="value">${(d.knowledge_gaps || []).length}</div><div class="label">薄弱点</div></div>
+                        <div class="stat-card"><div class="value">${activeSubjectCount}</div><div class="label">学科数量</div></div>
+                        <div class="stat-card"><div class="value">${activeTopicCount}</div><div class="label">知识点</div></div>
+                        <div class="stat-card"><div class="value">${filteredGaps.length}</div><div class="label">薄弱点</div></div>
                     </div>
                     <div style="margin-top:16px">
                         <div style="font-size:14px;color:#6b7280;margin-bottom:8px">学科</div>
@@ -830,6 +1119,58 @@ async def report_page(session_id: str):
             `;
         }
 
+        function getFilteredTopics() {
+            const topics = reportData.current_topics || [];
+            if (activeSubjects.size === 0) return topics;
+            // 如果没有选中学科，返回全部
+            if (activeSubjects.size === (reportData.subject_history || []).length) return topics;
+            // 根据当前会话数据，无法精确判断每个 topic 属于哪个学科
+            // 但我们可以检查 topic 名称中是否包含学科关键词
+            return topics;
+        }
+
+        function getFilteredMastery() {
+            const mastery = reportData.mastery_levels || {};
+            if (activeSubjects.size === 0) return mastery;
+            // 当前会话级筛选，返回全部（因为 mastery 是会话维度的）
+            return mastery;
+        }
+
+        function getFilteredGaps() {
+            const gaps = reportData.knowledge_gaps || [];
+            if (activeSubjects.size === 0) return gaps;
+            return gaps;
+        }
+
+        function renderCrossSessionSummary() {
+            if (!sessionsSummary || !sessionsSummary.subject_stats) return '';
+            const stats = sessionsSummary.subject_stats;
+            const entries = Object.entries(stats);
+            if (!entries.length) return '';
+
+            return `<div class="cross-session-summary">
+                <div class="cross-summary-title">📚 跨会话学科汇总</div>
+                <div class="cross-summary-grid">
+                    ${entries.map(([subj, s]) => `
+                        <div class="cross-subject-card" onclick="showSubjectReport('${subj}')">
+                            <div class="subj-name">${subj}</div>
+                            <div class="subj-stats">
+                                <div class="subj-stat">会话 <strong>${s.sessions}</strong> 个</div>
+                                <div class="subj-stat">轮次 <strong>${s.total_turns}</strong></div>
+                                <div class="subj-stat">练习 <strong>${s.total_quizzes}</strong> 次</div>
+                                <div class="subj-stat">正确率 <strong>${Math.round(s.avg_accuracy * 100)}%</strong></div>
+                            </div>
+                        </div>
+                    `).join('')}
+                </div>
+            </div>`;
+        }
+
+        function showSubjectReport(subject) {
+            // 跳转到学科统计页面
+            window.open(`/api/subject-statistics?subject=${encodeURIComponent(subject)}`, '_blank');
+        }
+
         function exportReport() {
             if (!reportData) return;
             const d = reportData;
@@ -866,7 +1207,7 @@ async def report_page(session_id: str):
                 '## 对话摘要',
                 d.conversation_summary || '无',
             ];
-            const blob = new Blob([lines.join('\n')], { type: 'text/markdown;charset=utf-8' });
+            const blob = new Blob([lines.join('\\n')], { type: 'text/markdown;charset=utf-8' });
             const url = URL.createObjectURL(blob);
             const a = document.createElement('a');
             a.href = url;
@@ -1091,6 +1432,18 @@ async def root():
             border-radius: 8px; font-size: 15px; font-weight: 600;
             color: #166534; text-align: center;
         }
+        /* 填空题样式 */
+        .fill-input {
+            width: 100%; padding: 8px 12px; border: 1px solid #e5e7eb;
+            border-radius: 8px; font-size: 14px; margin-top: 8px;
+            transition: border-color 0.15s;
+        }
+        .fill-input:focus { outline: none; border-color: #667eea; }
+        .fill-input:disabled { background: #f9fafb; cursor: default; }
+        .fill-input.correct { border-color: #10b981; background: #d1fae5; }
+        .fill-input.wrong { border-color: #ef4444; background: #fee2e2; }
+        .fill-answer { margin-top: 8px; font-size: 13px; color: #6b7280; }
+        .fill-answer strong { color: #1f2937; }
 
         /* 学习报告 */
         .report-panel {
@@ -1544,6 +1897,8 @@ async def root():
         }
 
         // ============ 功能：自动出卷 ============
+        let currentQuizState = { questions: [], answers: {}, total: 0, submitted: 0 };
+
         async function generateQuiz() {
             const loadingEl = document.createElement('div');
             loadingEl.className = 'message assistant';
@@ -1560,6 +1915,8 @@ async def root():
                 const data = await response.json();
                 loadingEl.remove();
                 addMessage('assistant', `已为你生成 ${data.questions.length} 道练习题，请作答：`);
+                // 重置答题状态
+                currentQuizState = { questions: data.questions, answers: {}, total: data.questions.length, submitted: 0 };
                 renderQuizCard(data.questions);
             } catch (error) {
                 loadingEl.remove();
@@ -1580,18 +1937,29 @@ async def root():
                 card.className = 'quiz-card';
                 card.dataset.index = idx;
                 card.dataset.correct = q.correct_answer || '';
+                card.dataset.type = q.type || 'choice';
 
-                let optionsHtml = '';
-                if (q.options && q.options.length > 0) {
-                    optionsHtml = q.options.map((opt, i) => {
-                        const label = opt.charAt(0);
-                        return `<div class="option" data-value="${label}" onclick="selectOption(this)">${opt}</div>`;
-                    }).join('');
+                let answerArea = '';
+                if ((q.type || 'choice') === 'fill') {
+                    answerArea = `
+                        <input type="text" class="fill-input"
+                            placeholder="请输入答案..."
+                            onkeydown="if(event.key==='Enter')submitQuestion(this.closest('.submit-btn'))">
+                        <div class="fill-answer" style="display:none"></div>`;
+                } else {
+                    let optionsHtml = '';
+                    if (q.options && q.options.length > 0) {
+                        optionsHtml = q.options.map((opt, i) => {
+                            const label = opt.charAt(0);
+                            return `<div class="option" data-value="${label}" onclick="selectOption(this)">${opt}</div>`;
+                        }).join('');
+                    }
+                    answerArea = `<div class="options">${optionsHtml}</div>`;
                 }
 
                 card.innerHTML = `
                     <div class="question">${idx + 1}. ${q.question}</div>
-                    <div class="options">${optionsHtml}</div>
+                    ${answerArea}
                     <button class="submit-btn" onclick="submitQuestion(this, ${idx})">提交答案</button>
                     <div class="explanation" style="display:none">${q.explanation || ''}</div>
                 `;
@@ -1609,31 +1977,97 @@ async def root():
 
         function submitQuestion(btn, idx) {
             const card = btn.closest('.quiz-card');
-            const selected = card.querySelector('.option.selected');
+            const q = currentQuizState.questions[idx];
             const correct = card.dataset.correct;
 
-            if (!selected) {
-                alert('请先选择一个答案');
-                return;
+            // 填空题
+            if (q.type === 'fill') {
+                const input = card.querySelector('.fill-input');
+                const answer = input.value.trim();
+                if (!answer) {
+                    alert('请先填写答案');
+                    return;
+                }
+                const isCorrect = answer.toLowerCase() === correct.toLowerCase();
+                input.disabled = true;
+                input.classList.add(isCorrect ? 'correct' : 'wrong');
+                const fillAnswerEl = card.querySelector('.fill-answer');
+                fillAnswerEl.style.display = 'block';
+                fillAnswerEl.innerHTML = isCorrect
+                    ? `<span style="color:#166534">✓ 正确</span>`
+                    : `<span style="color:#991b1b">✗ 你的答案：${answer}，正确答案：<strong>${correct}</strong></span>`;
+                btn.disabled = true;
+                btn.textContent = '已提交';
+                card.querySelector('.explanation').style.display = 'block';
+                currentQuizState.answers[idx] = answer;
+            }
+            // 选择题
+            else {
+                const selected = card.querySelector('.option.selected');
+                if (!selected) {
+                    alert('请先选择一个答案');
+                    return;
+                }
+                const selectedValue = selected.dataset.value;
+                const isCorrect = selectedValue === correct;
+
+                card.querySelectorAll('.option').forEach(opt => {
+                    opt.style.cursor = 'default';
+                    opt.onclick = null;
+                    if (opt.dataset.value === correct) {
+                        opt.classList.add('correct');
+                    } else if (opt.classList.contains('selected') && !isCorrect) {
+                        opt.classList.add('wrong');
+                    }
+                });
+
+                btn.disabled = true;
+                btn.textContent = '已提交';
+                card.querySelector('.explanation').style.display = 'block';
+                currentQuizState.answers[idx] = selectedValue;
             }
 
-            const selectedValue = selected.dataset.value;
-            const isCorrect = selectedValue === correct;
+            currentQuizState.submitted++;
 
-            // 显示正确/错误
-            card.querySelectorAll('.option').forEach(opt => {
-                opt.style.cursor = 'default';
-                opt.onclick = null;
-                if (opt.dataset.value === correct) {
-                    opt.classList.add('correct');
-                } else if (opt.classList.contains('selected') && !isCorrect) {
-                    opt.classList.add('wrong');
-                }
-            });
+            // 所有题目提交完 → 回传成绩
+            if (currentQuizState.submitted >= currentQuizState.total) {
+                submitQuizResult();
+            }
+        }
 
-            btn.disabled = true;
-            btn.textContent = '已提交';
-            card.querySelector('.explanation').style.display = 'block';
+        async function submitQuizResult() {
+            const totalCorrect = Object.entries(currentQuizState.answers).filter(
+                ([idx, ans]) => ans === currentQuizState.questions[idx].correct_answer
+            ).length;
+
+            try {
+                const resp = await fetch('/submit-quiz', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({
+                        session_id: sessionId,
+                        questions: currentQuizState.questions,
+                        answers: currentQuizState.answers,
+                        correct_count: totalCorrect,
+                    })
+                });
+                const result = await resp.json();
+                // 显示总成绩卡片
+                showScoreCard(result);
+            } catch (e) {
+                // 静默失败，不影响已提交的答题体验
+                console.error('提交成绩失败:', e);
+            }
+        }
+
+        function showScoreCard(result) {
+            const msgEl = document.createElement('div');
+            msgEl.className = 'message assistant';
+            const pct = Math.round(result.accuracy * 100);
+            const emoji = pct >= 80 ? '🎉' : pct >= 60 ? '👍' : '💪';
+            msgEl.innerHTML = `<div class="avatar">🤖</div><div class="bubble"><div class="score-display">${emoji} 本次练习得分：${result.correct_count}/${result.total_count}（${pct}%）</div></div>`;
+            messagesEl.appendChild(msgEl);
+            messagesEl.scrollTop = messagesEl.scrollHeight;
         }
 
         // ============ 功能：学习报告 ============

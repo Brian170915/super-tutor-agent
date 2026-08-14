@@ -171,9 +171,10 @@ QUIZ_BATCH_PROMPT = ChatPromptTemplate.from_messages([
 
 【要求】：
 1. 题目要贴合初中知识点，难度适中
-2. 每道题包含题干、4个选项（A/B/C/D）、正确答案和解析
-3. 题目类型包括选择题和填空题
-4. 围绕当前知识点出题，不要偏离主题
+2. 围绕当前知识点出题，不要偏离主题
+3. 题目类型包括选择题和填空题，比例约 2:1（选择题为主）
+4. 选择题：4个选项（A/B/C/D），正确答案为选项字母
+5. 填空题：题干用"____"表示填空位置，正确答案为简短词或数字
 
 输出格式（严格的 JSON，不要任何额外文字）：
 {{
@@ -185,6 +186,13 @@ QUIZ_BATCH_PROMPT = ChatPromptTemplate.from_messages([
       "options": ["A. 选项一", "B. 选项二", "C. 选项三", "D. 选项四"],
       "correct_answer": "A",
       "explanation": "解析内容"
+    }},
+    {{
+      "id": 2,
+      "type": "fill",
+      "question": "水的化学式是____。",
+      "correct_answer": "H2O",
+      "explanation": "水由两个氢原子和一个氧原子组成"
     }}
   ]
 }}"""),
